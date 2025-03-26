@@ -1,0 +1,23 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: promptdresser-deployment
+  labels:
+    app: promptdresser
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: promptdresser
+  template:
+    metadata:
+      labels:
+        app: promptdresser
+    spec:
+      containers:
+      - name: promptdresser
+        image: your-docker-registry/promptdresser:latest
+        imagePullPolicy: IfNotPresent
+        resources:
+          limits:
+            nvidia.com/gpu: 1
