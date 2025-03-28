@@ -18,6 +18,25 @@ spec:
       - name: promptdresser
         image: your-docker-registry/promptdresser:latest
         imagePullPolicy: IfNotPresent
+        volumeMounts:
+          - name: models-volume
+            mountPath: /models  # The directory where your GCS bucket will be mounted
         resources:
           limits:
             nvidia.com/gpu: 1
+        # Option 1: Overriding the default CMD by using args
+        args:
+          - bash
+          - -c
+          - >
+            CUDA_VISIBLE_DEVICES=0 python inference.py
+            --config_p '/models/configs/VITONHD.yaml'
+            --pretrained_unet_path '/models/checkpoints/VITONHD/model/pytorch_model.bin'
+            --init_model_path '/models/pretrained_models/stable-diffusion-xl-1.0-inpainting-0.1'
+            --init_cloth_encoder_path '/models/pretrained_models/stable-diffusion-xl-base-1.0'
+            --init_vae_path '/models/pretrained_models/sdxl-vae-fp16-fix'
+            --save_name VITONHD
+      volumes:
+      - name: models-volume
+        persistentVolumeClaim:
+          claimName: models-pvc
