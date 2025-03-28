@@ -45,7 +45,6 @@ def parse_args():
     parser.add_argument("--pad_type", default=None, choices=["constant", "reflect"])
     parser.add_argument("--save_root_dir", type=str, default="./sampled_images")
     parser.add_argument("--save_name", type=str, default="dummy")
-
     parser.add_argument("--strength", type=float, default=1.0)
     parser.add_argument("--no_zero_snr", action="store_true")
     parser.add_argument("--img_h", type=int, default=1024)
@@ -62,44 +61,63 @@ def parse_args():
     args = parser.parse_args()
     args.save_dir = opj(args.save_root_dir, args.save_name)
     os.makedirs(args.save_dir, exist_ok=True)
+    print("Arguments parsed and save directory created:", args.save_dir)
     return args
 
+print("Starting inference script...")
 args = parse_args()
+print("Loading config from:", args.config_p)
 config = OmegaConf.load(args.config_p)
 if args.interm_cloth_start_ratio is not None:
     config.interm_cloth_start_ratio = args.interm_cloth_start_ratio
+
+print("Initializing Accelerator...")
 accelerator = Accelerator(mixed_precision=args.mixed_precision)
 weight_dtype = torch.float16
+print("Accelerator initialized on device:", accelerator.device)
 
-
+print("Loading noise scheduler...")
 noise_scheduler = DDPMScheduler.from_pretrained(
     args.init_model_path, subfolder="scheduler", 
     rescale_betas_zero_snr=not args.no_zero_snr, 
     timestep_spacing=args.timestep_spacing
 )
+print("Noise scheduler loaded.")
+
+print("Loading tokenizer and text encoder...")
 tokenizer = CLIPTokenizer.from_pretrained(args.init_model_path, subfolder="tokenizer")
 text_encoder = CLIPTextModel.from_pretrained(args.init_model_path, subfolder="text_encoder")
 tokenizer_2 = CLIPTokenizer.from_pretrained(args.init_model_path, subfolder="tokenizer_2")
 text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(args.init_model_path, subfolder="text_encoder_2")
+print("Tokenizers and text encoders loaded.")
+
+print("Loading VAE models...")
 vae = AutoencoderKL.from_pretrained(args.init_vae_path)
+print("Loading UNet models...")
 unet = UNet2DConditionModel.from_pretrained(args.init_model_path, subfolder="unet")
+print("Loading Cloth Encoder...")
 cloth_encoder = ClothEncoder.from_pretrained(args.init_cloth_encoder_path, subfolder="unet")
+print("Models loaded.")
 
 unet.add_clothing_text = False
 
+print("Disabling gradients for models...")
 unet.requires_grad_(False)
 vae.requires_grad_(False)
 text_encoder.requires_grad_(False)
 cloth_encoder.requires_grad_(False)
 text_encoder_2.requires_grad_(False)
 
+print("Moving models to device...")
 unet.to(accelerator.device, dtype=weight_dtype)
 vae.to(accelerator.device, dtype=weight_dtype)
 text_encoder.to(accelerator.device, dtype=weight_dtype)
 text_encoder_2.to(accelerator.device, dtype=weight_dtype)
 cloth_encoder.to(accelerator.device, dtype=weight_dtype)
+print("Models moved to:", accelerator.device)
 
 if not config.get("detach_cloth_encoder", False):
+    print("Initializing ReferenceAttentionControl for cloth encoder and UNet...")
     reference_control_writer = ReferenceAttentionControl(
         cloth_encoder, 
         do_classifier_free_guidance=True, 
@@ -119,15 +137,19 @@ if not config.get("detach_cloth_encoder", False):
         is_second_stage=False, 
         use_jointcond=config.get("use_jointcond", False)
     )
+    print("ReferenceAttentionControl initialized.")
 
 if args.pretrained_unet_path is not None:
+    print("Loading pretrained UNet from:", args.pretrained_unet_path)
     unet.load_state_dict(load_file(args.pretrained_unet_path))
     zero_rank_print_(f"unet is loaded from {args.pretrained_unet_path}")
 
 if args.pretrained_cloth_encoder_path is not None:
+    print("Loading pretrained Cloth Encoder from:", args.pretrained_cloth_encoder_path)
     cloth_encoder.load_state_dict(load_file(args.pretrained_cloth_encoder_path), strict=False)
     zero_rank_print_(f"cloth_encoder is loaded from {args.pretrained_cloth_encoder_path}")
     
+print("Initializing PromptDresser pipeline...")
 pipeline = PromptDresser(
     vae=vae,
     text_encoder=text_encoder,
@@ -137,11 +159,10 @@ pipeline = PromptDresser(
     unet=unet,
     scheduler=noise_scheduler,
 ).to(accelerator.device, dtype=weight_dtype)
-
 pipeline.set_progress_bar_config(leave=False)
+print("Pipeline initialized.")
 
-
-
+print("Preparing validation pairs...")
 dataset_config = config.dataset
 pair_type_lst = []
 img_bns_lst = []
@@ -150,6 +171,7 @@ full_txts_lst = []
 clothing_txts_lst = []
 
 if not args.skip_paired:
+    print("Loading paired validation pairs...")
     paired_img_bns, paired_c_bns, paired_full_txts, paired_clothing_txts = get_validation_pairs(
         **dataset_config, is_paired=True, proc_idx=accelerator.process_index, n_proc=accelerator.num_processes, data_type="test", 
     )
@@ -160,6 +182,7 @@ if not args.skip_paired:
     clothing_txts_lst.append(paired_clothing_txts)
 
 if not args.skip_unpaired:
+    print("Loading unpaired validation pairs...")
     unpaired_img_bns, unpaired_c_bns, unpaired_full_txts, unpaired_clothing_txts = get_validation_pairs(
         **dataset_config, is_paired=False, proc_idx=accelerator.process_index, n_proc=accelerator.num_processes, data_type="test", 
     )
@@ -169,7 +192,9 @@ if not args.skip_unpaired:
     full_txts_lst.append(unpaired_full_txts)
     clothing_txts_lst.append(unpaired_clothing_txts)
 
+print("Starting inference loop...")
 for idx, (pair_type, img_bns, c_bns, full_txts, clothing_txts) in enumerate(zip(pair_type_lst, img_bns_lst, c_bns_lst, full_txts_lst, clothing_txts_lst)):  
+    print(f"Processing pair type: {pair_type}")
     if args.skip_paired and pair_type=="paired":
         zero_rank_print_("skip paired")
         continue
@@ -179,6 +204,7 @@ for idx, (pair_type, img_bns, c_bns, full_txts, clothing_txts) in enumerate(zip(
 
     img_save_dir = opj(args.save_dir, pair_type)
     os.makedirs(img_save_dir, exist_ok=True)
+    print(f"Saving images to directory: {img_save_dir}")
 
     with tqdm(enumerate(zip(img_bns, c_bns, full_txts, clothing_txts)), total=len(img_bns), unit="iter", ncols=75) as tl:
         for sample_idx, (img_bn, c_bn, full_txt, clothing_txt) in tl:
@@ -186,8 +212,10 @@ for idx, (pair_type, img_bns, c_bns, full_txts, clothing_txts) in enumerate(zip(
                 print(f"skip {sample_idx}")
                 continue
 
-            tl.set_description(f"sample {pair_type}")
+            tl.set_description(f"sample {pair_type} - idx {sample_idx}")
+            print(f"Processing sample index: {sample_idx}")
             for repeat_idx in range(args.n_repeat_samples):
+                print(f"Repeat index: {repeat_idx}")
                 img_fn = os.path.splitext(img_bn)[0]
                 c_fn = os.path.splitext(c_bn)[0]
                 if args.n_repeat_samples == 1:
@@ -211,6 +239,7 @@ for idx, (pair_type, img_bns, c_bns, full_txts, clothing_txts) in enumerate(zip(
                 )
                 
                 if config.get("use_interm_cloth_mask", False):
+                    print("Generating intermediate cloth mask...")
                     _person, _mask, _pose, _cloth = get_inputs(
                         root_dir=dataset_config.data_root_dir,
                         data_type="test",
@@ -248,11 +277,12 @@ for idx, (pair_type, img_bns, c_bns, full_txts, clothing_txts) in enumerate(zip(
                                 use_pad=config.get("interm_cloth_pad", False),
                                 generator = None,
                         )
-
                         interm_cloth_mask = interm_cloth_mask.resize((args.img_w, args.img_h), Image.NEAREST)
-                        mask = Image.fromarray(np.maximum(np.array(mask), np.array(interm_cloth_mask)[:,:,None]))
-                
+                        mask = Image.fromarray(np.maximum(np.array(mask), np.array(interm_cloth_mask)[:, :, None]))
+                        print("Intermediate cloth mask generated.")
+
                 with torch.autocast("cuda"):
+                    print("Running pipeline inference...")
                     print(f"full txt : {full_txt}")
                     print(f"clothing txt : {clothing_txt}")
                     sample = pipeline(
@@ -276,18 +306,23 @@ for idx, (pair_type, img_bns, c_bns, full_txts, clothing_txts) in enumerate(zip(
                         category=dataset_config.get("category", None),
                         generator = None,
                     ).images[0]
-                    
+                    print("Inference done for current sample.")
+
                     if args.pad_type:
                         sample = sample.crop((128, 0, 640, 1024))
+                        print("Image cropped due to pad_type.")
 
                     inverse_mask = np.array(mask) < 0.5
                     agn_img = Image.fromarray(np.uint8(np.array(person) * inverse_mask.astype(np.float32)))
                     sample.save(to_p)
+                    print(f"Saved generated image to: {to_p}")
 
-
+print("Inference loop completed. Waiting for accelerator sync...")
 accelerator.wait_for_everyone()
 torch.cuda.empty_cache()
 gc.collect()
+print("Memory cleared.")
+
 if args.skip_paired:
     pair_type_lst = ["unpaired"]
 elif args.skip_unpaired:
@@ -302,4 +337,5 @@ if accelerator.is_main_process:
     
         eval_cmd = f"python evaluation.py --gt_dir {gt_dir} --pred_dir {img_save_dir} &"
         os.system(eval_cmd)
+        print(f"Started evaluation for {pair_type}")
     print("Done")
